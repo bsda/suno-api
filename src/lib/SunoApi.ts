@@ -204,10 +204,11 @@ class SunoApi {
   }
 
   private async captchaRequired(): Promise<boolean> {
+    logger.info('[captcha-check] Checking if CAPTCHA is required...');
     const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
       ctype: 'generation'
     });
-    logger.info(resp.data);
+    logger.info({ required: resp.data.required, fullResponse: resp.data }, '[captcha-check] Result');
     return resp.data.required;
   }
 
@@ -305,68 +306,94 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
-    if (!await this.captchaRequired())
+    if (!await this.captchaRequired()) {
+      logger.info('[captcha] Not required — skipping browser launch');
       return null;
+    }
 
-    logger.info('CAPTCHA required. Launching browser...')
+    logger.info('[captcha] CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
     await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
 
-    logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+    logger.info('[captcha] Waiting for Suno interface to load...');
+    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 });
+    logger.info('[captcha] Suno interface loaded');
 
     if (this.ghostCursorEnabled)
       this.cursor = await createCursor(page);
     
-    logger.info('Triggering the CAPTCHA');
+    logger.info('[captcha] Closing popups...');
     try {
-      await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-    } catch(e) {}
+      await page.getByLabel('Close').click({ timeout: 2000 });
+      logger.info('[captcha] Popup closed');
+    } catch(e) {
+      logger.info('[captcha] No popup found');
+    }
 
     // Navigate away and back to make textareas interactive (initial load blocks input)
+    logger.info('[captcha] Navigating Home → Create to reset UI state...');
     await page.locator('a:has-text("Home")').first().click();
     await page.waitForTimeout(1500);
     await page.locator('a:has-text("Create")').first().click();
     await page.waitForTimeout(1500);
+    logger.info('[captcha] Back on Create page');
 
     // Switch to Advanced mode
+    logger.info('[captcha] Switching to Advanced mode...');
     await page.getByText('Advanced', { exact: true }).click();
     await page.waitForTimeout(1000);
+    logger.info('[captcha] Advanced mode active');
 
     // Type into the lyrics textarea to enable the Create button
+    logger.info('[captcha] Typing into lyrics textarea...');
     const lyricsTextarea = page.locator('[data-testid="lyrics-textarea"]');
     await lyricsTextarea.click();
     await page.keyboard.type('pop', { delay: 100 });
     const value = await lyricsTextarea.inputValue();
-    logger.info(`Lyrics textarea value after typing: "${value}"`);
+    logger.info(`[captcha] Lyrics textarea value: "${value}"`);
 
     // Set up route interceptor BEFORE clicking Create to:
     // 1. Abort the request (so the throwaway song doesn't waste credits)
     // 2. Extract the auth token and captcha token from the request
+    logger.info('[captcha] Setting up route interceptor for **/api/generate/**');
     const controller = new AbortController();
+
+    // Log ALL outgoing requests to see what URLs the browser hits
+    page.on('request', (request: any) => {
+      const url = request.url();
+      if (url.includes('suno.com/api') || url.includes('studio-api')) {
+        logger.info(`[captcha] Browser request: ${request.method()} ${url}`);
+      }
+    });
+
     const tokenPromise = new Promise<string|null>((resolve, reject) => {
       page.route('**/api/generate/**', async (route: any) => {
         try {
           const request = route.request();
+          const url = request.url();
           const postData = request.postDataJSON();
-          logger.info({ postData }, 'Intercepted generation request');
-          route.abort(); // prevent the throwaway song from generating
+          logger.info({ url, hasToken: !!postData?.token, postDataKeys: Object.keys(postData || {}) }, '[captcha] INTERCEPTED generation request — aborting');
+          route.abort();
           controller.abort();
           this.currentToken = request.headers().authorization.split('Bearer ').pop();
+          logger.info('[captcha] Auth token extracted, closing browser');
           browser.browser()?.close();
           resolve(postData?.token ?? null);
         } catch(err) {
+          logger.error({ err }, '[captcha] Route interception error');
           reject(err);
         }
       });
     });
 
     // Click the Create button — the request will be intercepted and aborted
+    logger.info('[captcha] Looking for Create song button...');
     const button = page.locator('button[aria-label="Create song"]');
     await button.waitFor({ state: 'visible', timeout: 5000 });
+    logger.info('[captcha] Clicking Create song button...');
     await this.click(button);
+    logger.info('[captcha] Create clicked — waiting for interceptor or hCaptcha...');
 
     // If hCaptcha appears, solve it (legacy path)
     new Promise<void>(async (resolve, reject) => {
@@ -446,7 +473,9 @@ class SunoApi {
       throw e;
     });
 
-    return tokenPromise;
+    const token = await tokenPromise;
+    logger.info({ hasToken: !!token, tokenLength: token?.length ?? 0 }, '[captcha] Token extraction complete');
+    return token;
   }
 
   /**
@@ -632,6 +661,7 @@ class SunoApi {
           2
         )
     );
+    logger.info({ url: `${SunoApi.BASE_URL}/api/generate/v2-web/`, hasToken: !!payload.token, model: payload.mv }, '[generate] Sending generation request...');
     const response = await this.client.post(
       `${SunoApi.BASE_URL}/api/generate/v2-web/`,
       payload,
@@ -639,6 +669,7 @@ class SunoApi {
         timeout: 10000 // 10 seconds timeout
       }
     );
+    logger.info({ status: response.status, clipCount: response.data?.clips?.length ?? 0 }, '[generate] Generation response received');
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
