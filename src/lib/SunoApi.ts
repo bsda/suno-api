@@ -347,7 +347,7 @@ class SunoApi {
     // 2. Extract the auth token and captcha token from the request
     const controller = new AbortController();
     const tokenPromise = new Promise<string|null>((resolve, reject) => {
-      page.route('**/api/generate/v2**', async (route: any) => {
+      page.route('**/api/generate/**', async (route: any) => {
         try {
           const request = route.request();
           const postData = request.postDataJSON();
