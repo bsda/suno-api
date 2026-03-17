@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = 'chirp-auk-turbo';
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -323,17 +323,52 @@ class SunoApi {
     logger.info('Triggering the CAPTCHA');
     try {
       await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
     } catch(e) {}
 
-    const textarea = page.locator('.custom-textarea');
-    await this.click(textarea);
-    await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
+    // Navigate away and back to make textareas interactive (initial load blocks input)
+    await page.locator('a:has-text("Home")').first().click();
+    await page.waitForTimeout(1500);
+    await page.locator('a:has-text("Create")').first().click();
+    await page.waitForTimeout(1500);
 
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
-    this.click(button);
+    // Switch to Advanced mode
+    await page.getByText('Advanced', { exact: true }).click();
+    await page.waitForTimeout(1000);
 
+    // Type into the lyrics textarea to enable the Create button
+    const lyricsTextarea = page.locator('[data-testid="lyrics-textarea"]');
+    await lyricsTextarea.click();
+    await page.keyboard.type('pop', { delay: 100 });
+    const value = await lyricsTextarea.inputValue();
+    logger.info(`Lyrics textarea value after typing: "${value}"`);
+
+    // Set up route interceptor BEFORE clicking Create to:
+    // 1. Abort the request (so the throwaway song doesn't waste credits)
+    // 2. Extract the auth token and captcha token from the request
     const controller = new AbortController();
+    const tokenPromise = new Promise<string|null>((resolve, reject) => {
+      page.route('**/api/generate/v2**', async (route: any) => {
+        try {
+          const request = route.request();
+          const postData = request.postDataJSON();
+          logger.info({ postData }, 'Intercepted generation request');
+          route.abort(); // prevent the throwaway song from generating
+          controller.abort();
+          this.currentToken = request.headers().authorization.split('Bearer ').pop();
+          browser.browser()?.close();
+          resolve(postData?.token ?? null);
+        } catch(err) {
+          reject(err);
+        }
+      });
+    });
+
+    // Click the Create button — the request will be intercepted and aborted
+    const button = page.locator('button[aria-label="Create song"]');
+    await button.waitFor({ state: 'visible', timeout: 5000 });
+    await this.click(button);
+
+    // If hCaptcha appears, solve it (legacy path)
     new Promise<void>(async (resolve, reject) => {
       const frame = page.frameLocator('iframe[title*="hCaptcha"]');
       const challenge = frame.locator('.challenge-container');
@@ -352,7 +387,6 @@ class SunoApi {
                 lang: process.env.BROWSER_LOCALE
               };
               if (drag) {
-                // Say to the worker that he needs to click
                 payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
                 payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
               }
@@ -365,7 +399,7 @@ class SunoApi {
               else
                 throw err;
             }
-          } 
+          }
           if (drag) {
             const challengeBox = await challenge.boundingBox();
             if (challengeBox == null)
@@ -394,15 +428,15 @@ class SunoApi {
             };
           }
           this.click(frame.locator('.button-submit')).catch(e => {
-            if (e.message.includes('viewport')) // when hCaptcha window has been closed due to inactivity,
-              this.click(button); // click the Create button again to trigger the CAPTCHA
+            if (e.message.includes('viewport'))
+              this.click(button);
             else
               throw e;
           });
         }
       } catch(e: any) {
-        if (e.message.includes('been closed') // catch error when closing the browser
-          || e.message == 'AbortError') // catch error when waitForRequests is aborted
+        if (e.message.includes('been closed')
+          || e.message == 'AbortError')
           resolve();
         else
           reject(e);
@@ -411,21 +445,8 @@ class SunoApi {
       browser.browser()?.close();
       throw e;
     });
-    return (new Promise((resolve, reject) => {
-      page.route('**/api/generate/v2/**', async (route: any) => {
-        try {
-          logger.info('hCaptcha token received. Closing browser');
-          route.abort();
-          browser.browser()?.close();
-          controller.abort();
-          const request = route.request();
-          this.currentToken = request.headers().authorization.split('Bearer ').pop();
-          resolve(request.postDataJSON().token);
-        } catch(err) {
-          reject(err);
-        }
-      });
-    }));
+
+    return tokenPromise;
   }
 
   /**
@@ -509,7 +530,9 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    style_weight?: number,
+    weirdness_constraint?: number
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     const audios = await this.generateSongs(
@@ -520,7 +543,12 @@ class SunoApi {
       make_instrumental,
       model,
       wait_audio,
-      negative_tags
+      negative_tags,
+      undefined,
+      undefined,
+      undefined,
+      style_weight,
+      weirdness_constraint
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -555,7 +583,9 @@ class SunoApi {
     negative_tags?: string,
     task?: string,
     continue_clip_id?: string,
-    continue_at?: number
+    continue_at?: number,
+    style_weight?: number,
+    weirdness_constraint?: number
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
     const payload: any = {
@@ -568,6 +598,15 @@ class SunoApi {
       task: task,
       token: await this.getCaptcha()
     };
+    if (style_weight != null || weirdness_constraint != null) {
+      payload.metadata = {
+        ...payload.metadata,
+        control_sliders: {
+          ...(style_weight != null && { style_weight }),
+          ...(weirdness_constraint != null && { weirdness_constraint }),
+        },
+      };
+    }
     if (isCustom) {
       payload.tags = tags;
       payload.title = title;
@@ -594,7 +633,7 @@ class SunoApi {
         )
     );
     const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
+      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
       payload,
       {
         timeout: 10000 // 10 seconds timeout
